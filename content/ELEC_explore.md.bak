@@ -1,0 +1,1163 @@
+
+# Overview of Electricity Generation in the USA based on EIA data
+
+The following is an exercise in using data from the Electricity Information Agency (EIA),
+to familiarize myself with both the broad state of the US electrical grid, as well as some elementary data science.
+This is based on the bulk ELEC dataset, which contains monthly temporal resolution, and has plant level
+and state level summaries.  The dataset includes generation by source, fuel quality, number of customers, cost of electricity and sales.
+While the EIA offers an API for current access, but as someone new to this dataset it was simpler to start exploring from the bulk data set, which is only around 1GB. 
+
+I have converted the bulk data file from (url_here) to a local SQL database.
+I used Psycopg2 for direct SQL interaction with that PostGRESQL database. 
+I can then efficiently select data from that database, based on geographic region and type of generation.  (While the data should nominally fit into memory in one Pandas dataframe, I found that my computer ran out of memory before it could be loaded.) 
+
+The resulting queries from SQL can then be converted into a Pandas dataframe.  Since the data is of the form
+"[[date1,number1],[date2,number]...], as one long string, this is converted into a list, then a Numpy array.
+The first column is used to generate a Pandas PeriodIndex (which is then further converted to a DateTimeIndex for plotting reasons).  The second column is then indexed.  The resulting series is output as the elements of a list of series for the desired state, and generation type.  
+These results can then be plotted using basic Matplotlib.
+
+
+```python
+import pandas as pd
+import numpy as np
+import sqlalchemy
+import psycopg2
+import datetime 
+import matplotlib.pyplot as plt
+from psycopg2 import sql
+from mpl_toolkits.basemap import Basemap  #mapping utility
+import pickle   #Useful for caching maps
+
+%load_ext autoreload
+%autoreload 2
+```
+
+The data is provided as JSON format, with lots of metadata, and connections between series.  The data was split into chunks, and loaded into SQL as text (The time series proper were also stored as a single list for each entry.)
+
+
+```python
+#Set up connections to SQL database, which was generated from the bulk JSON file.
+database_name='US_ELEC'
+fname='ELEC'
+table_name=fname
+engine=sqlalchemy.create_engine("postgresql+psycopg2://localhost/"+database_name)
+
+#make connection to database (which is needed by Pandas), 
+# and the cursor which actually executes SQL commands.
+conn=psycopg2.connect(dbname=database_name,host='localhost')
+conn.set_session(autocommit=True)
+cur = conn.cursor()
+
+```
+
+
+```python
+#count the number of series
+q=sql.SQL('SELECT count(*) FROM "ELEC"')
+cur.execute(q)
+cur.fetchall()
+```
+
+
+
+
+    [(562601,)]
+
+
+
+
+```python
+#grab a single entry to look at data
+# q=sql.SQL('SELECT * FROM "ELEC" LIMIT 1')
+# cur.execute(q)
+# cur.fetchall()
+```
+
+The following defines some useful functions for grabbing SQL queries, and loading the desired columns into a Pandas DataFrame.
+Most of this is just converting python variables to SQL variables, for simple SQL queries of the form
+"SELECT {columns} FROM table WHERE name like '{pattern}' and freq LIKE {freq}".
+
+
+```python
+#make SQL queries, with desired list of columns in "out_columns".
+#Assume we are searching through name for entries with desired type of series, for particular states,
+#as well as generation type.
+def safe_sql_query(table_name, out_columns, match_names, freq):
+    """safe_sql_query(table_name, out_column, match_names, freq)
+    Extract a set of columns where the name matches certain critera.
+
+    Input:
+    table_name - name for table
+    out_columns - list of desired columns
+    match_names - desired patterns that the name must match.  (All joined via AND)
+    freq   - desired frequency     
+
+    Return: 
+    sql query to carry out desired command.
+    """
+
+    col_query=sql.SQL(' ,').join(map(sql.Identifier,out_columns))
+    #make up categories to match the name by.
+    namelist=[];
+    for namevar in match_names:
+        namelist.append(sql.Literal('%'+namevar+'%'))
+        #join together these matches with ANDs to match them all
+        name_query=sql.SQL(' AND name LIKE ').join(namelist)
+    #Total SQL query to select desired columns with features 
+    q1 = sql.SQL("SELECT {0} FROM {1} WHERE (name LIKE {2} AND f LIKE {3}) ").format(
+        col_query,
+        sql.Identifier(table_name),
+        name_query,
+        sql.Literal(freq))
+    return(q1)
+
+def get_column_query(table_name, out_column):
+    """get_column_query(table_name, out_column)
+    Return SQL query to extract 'out_column' from 'table_name'
+    """
+    #make up categories to match the name by.
+    #Total SQL query to select desired columns with features 
+    q1 = sql.SQL("SELECT {0} FROM {1}").format(
+        sql.Identifier(out_column),
+        sql.Identifier(table_name))
+    return(q1)
+
+#Get a dataframe from SQL database for given psycopg2 cursor,
+#with desired output columns.     
+#Must select data based on series type, state, and type of generation.
+def get_dataframe(cur, table_name, out_columns, match_names, freq):
+    """get_dataframe(cur, table_name, out_columns, match_names, freq)
+    Generate pandas dataframe from calling SQL database. 
+    Dataframe will contain 'out_columns', in cases where the names 
+    contain all of the entries in 'match_names'
+
+    Input: cur - psycopg2 cursor connected to database
+    table_name -SQL table name
+    out_columns - columns to extract from SQL
+    match_names - list of strings that the 'name' must match
+    freq      - desired frequency
+
+    Output:
+    df  - pandas Dataframe
+    """
+    
+    q = safe_sql_query(table_name,out_columns,match_names,freq)
+    cur.execute(q);
+    df0=cur.fetchall();
+    df = pd.DataFrame(df0,columns=out_columns);
+    return df
+
+```
+
+
+```python
+#Initial readin of SQL dataframes returns 'data' as a string of a list of lists.  
+#This function goes row by row, converting that 'data' column
+#into a new series, with datetimeindex in 'data2'
+
+# Make a Period Index - really, really easy.
+#But plotting is limited with "Periods".  It seems only
+#"DateTimeIndices" allow easy combinations.  Use to_timestamp to convert to a DatetimeIndex.
+def convert_data(df):
+    Nrows=len(df)
+    print('Nrows',Nrows)
+    data_array=[];
+    for i in range(0,Nrows):
+        #check there's actually data there.
+        #use next line since the read in dataframe has returned a string.
+        #print('Converting #',i)
+        init_series=np.asarray(eval(df.iloc[i]['data']))
+        dat2=init_series[:,1].astype(float);
+        f = df.iloc[i]['f']
+        periodindex=pd.PeriodIndex(init_series[:,0],freq=f)
+        s=pd.Series(dat2,index=periodindex)
+        data_array.append(s.to_timestamp())
+    return data_array
+
+```
+
+## United States Seasonal Variation
+
+Let's now look at national level data for the United States as a whole.
+
+
+```python
+#grab the data from SQL.  Also converts each data string into a series (associated with each name/id)
+out_col=('name','data','start','end','f')
+match_names=[': United States :'];    
+df_usa=get_dataframe(cur,'ELEC',out_col,match_names,freq='M');
+data0=convert_data(df_usa)
+df_usa['data2']=data0
+```
+
+    Nrows 915
+
+
+First, lets look at the types of series available on a national level.  We'll find the type of series by splitting up the names, and counting the numbers of each type.  
+
+
+```python
+#split all series names at ':', and grab first entry of resulting list to get the highest level type of series.
+name_split=df_usa['name'].str.split(':')
+name0=name_split.apply(lambda x: x[0])
+name_df=pd.DataFrame(name0,columns=['name'])
+unique_names=name0.unique()
+```
+
+
+```python
+#count up number of each type of series.
+counts=np.zeros(len(unique_names))
+i=0
+for name in unique_names:
+    #avoid using regex to allow parentheses
+    counts[i]=np.sum(name0.str.contains(name,regex=False))
+    i+=1
+
+name_df=pd.DataFrame(data={'name':unique_names,'count':counts})
+print(name_df)
+```
+
+        count                                                                name
+    0     6.0                                        Retail sales of electricity 
+    1   150.0                     Receipts of fossil fuels by electricity plants 
+    2   115.0                  Quality of fossil fuels in electricity generation 
+    3    18.0                      Fossil-fuel stocks for electricity generation 
+    4     6.0                           Revenue from retail sales of electricity 
+    5    75.0               Receipts of fossil fuels by electricity plants (Btu) 
+    6     6.0                                Average retail price of electricity 
+    7   196.0                                                     Net generation 
+    8    94.0                                                  Total consumption 
+    9     5.0                                        Number of customer accounts 
+    10  150.0            Average cost of fossil fuels for electricity generation 
+    11   37.0                        Consumption for useful thermal output (Btu) 
+    12   75.0  Average cost of fossil fuels for electricity generation (per Btu) 
+    13   75.0                              Consumption for useful thermal output 
+    14   47.0                       Consumption for electricity generation (Btu) 
+    15   47.0                                            Total consumption (Btu) 
+    16   94.0                             Consumption for electricity generation 
+
+
+The bewildering number of series is due to the number of types of fuel, and differing types of fuels associated with each type of generation, as well as variation by sector and size of generator.  
+
+
+```python
+#Find unique types of generation by further splitting
+msk=df_usa['name'].str.contains('Net generation')
+df_usa[msk]['name'].str.split(':').apply(lambda x:x[1]).unique()
+```
+
+
+
+
+    array([' wind ', ' coal ', ' natural gas ', ' other biomass ',
+           ' all utility-scale solar ', ' nuclear ', ' other ',
+           ' conventional hydroelectric ', ' wood and wood-derived fuels ',
+           ' other gases ', ' hydro-electric pumped storage ',
+           ' petroleum liquids ', ' utility-scale photovoltaic ',
+           ' utility-scale thermal ', ' all solar ', ' all fuels ',
+           ' petroleum coke ', ' distributed photovoltaic ', ' geothermal ',
+           ' other renewables (total) '], dtype=object)
+
+
+
+Lets now plot the main generators on the national level.
+
+
+```python
+#Plot out each of the rows of a dataframe, with the label given by the name of the row.
+def plot_data_frame(df,title,xlabel,ylabel,labels=None,logy=False):
+    if labels is None:
+        labels=df['name'].values
+    for i in range(0,len(df)):
+        if (logy==True):
+           plt.semilogy(df.iloc[i]['data2'],label=labels[i])
+        else:
+           plt.plot(df.iloc[i]['data2'],label=labels[i])           
+    plt.legend(loc='upper left',bbox_to_anchor=(1,1))
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)        
+    plt.title(title)
+    plt.show()
+    return
+```
+
+
+```python
+#select out series across all sectors for each type of generation
+msk1=df_usa['name'].str.contains('Net generation')
+msk2=df_usa['name'].str.contains('all sectors')
+df_gen=df_usa[msk1&msk2]
+#now sort plotting order by which has largest values.
+df_gen_max=df_gen.loc['2016']['data2'].apply(max)
+plt_ind=df_gen_max.sort_values(ascending=False).index
+#extract out source part of labels via regex, select first match, and convert to array
+gen_labels=df_usa.iloc[plt_ind]['name'].str.extractall('Net generation : ([\s\w\(\)-]+):')[0].values
+```
+
+
+    ---------------------------------------------------------------------------
+
+    KeyError                                  Traceback (most recent call last)
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/indexing.py in _has_valid_type(self, key, axis)
+       1433                 if not ax.contains(key):
+    -> 1434                     error()
+       1435             except TypeError as e:
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/indexing.py in error()
+       1428                 raise KeyError("the label [%s] is not in the [%s]" %
+    -> 1429                                (key, self.obj._get_axis_name(axis)))
+       1430 
+
+
+    KeyError: 'the label [2016] is not in the [index]'
+
+    
+    During handling of the above exception, another exception occurred:
+
+
+    KeyError                                  Traceback (most recent call last)
+
+    <ipython-input-16-474d80cf5cf6> in <module>()
+          4 df_gen=df_usa[msk1&msk2]
+          5 #now sort plotting order by which has largest values.
+    ----> 6 df_gen_max=df_gen.loc['2016']['data2'].apply(max)
+          7 plt_ind=df_gen_max.sort_values(ascending=False).index
+          8 #extract out source part of labels via regex, select first match, and convert to array
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/indexing.py in __getitem__(self, key)
+       1326         else:
+       1327             key = com._apply_if_callable(key, self.obj)
+    -> 1328             return self._getitem_axis(key, axis=0)
+       1329 
+       1330     def _is_scalar_access(self, key):
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/indexing.py in _getitem_axis(self, key, axis)
+       1549 
+       1550         # fall thru to straight lookup
+    -> 1551         self._has_valid_type(key, axis)
+       1552         return self._get_label(key, axis=axis)
+       1553 
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/indexing.py in _has_valid_type(self, key, axis)
+       1440                 raise
+       1441             except:
+    -> 1442                 error()
+       1443 
+       1444         return True
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/indexing.py in error()
+       1427                                     "key")
+       1428                 raise KeyError("the label [%s] is not in the [%s]" %
+    -> 1429                                (key, self.obj._get_axis_name(axis)))
+       1430 
+       1431             try:
+
+
+    KeyError: 'the label [2016] is not in the [index]'
+
+
+
+```python
+q=sql.SQL('SELECT units FROM "ELEC" WHERE name LIKE \'%retail price%United States%:%\'')
+cur.execute(q)
+cur.fetchall()
+```
+
+
+
+
+    [('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',),
+     ('cents per kilowatthour',)]
+
+
+
+
+```python
+plot_data_frame(df_usa.iloc[plt_ind],
+xlabel='Date',
+ylabel='Net Generation (GWh)',title='Generation Across US by source',
+labels=gen_labels)
+```
+
+
+![png](ELEC_explore_files/ELEC_explore_20_0.png)
+
+
+Evidently coal, natural gas and nuclear power provide the vast majority of the US's electrical supply.
+While coal use is declining, that decline is matched by an increase in the use of natural gas. 
+Nuclear power is fairly stable, reflecting that there are few new nuclear plants being built.
+
+Of the renewables, wind and hydroelectric are the dominant providers.
+Hydroelectric is the largest renewable, but is largely static, reflecting the fact that most available hydro sources have already been exploited.
+Solar capacity has shown exponential growth, the supply of wind-based electricity generation has been growing over the last decade. 
+
+Note that these are all monthly totals.  These do not capture the short scale fluctuations that can occur on the minute to hour timescale which can impact the usefulness of renewables, and are the primary difficulty in incorporating them into the grid.
+
+Let's look at another plot focusing on the smaller terms, on both log/linear scales.
+
+
+```python
+df_gen_sub=df_usa.iloc[plt_ind]
+```
+
+
+```python
+sub_ind=[4,6,8,9,10,11,13]
+plt.figure()
+plot_data_frame(df_usa.iloc[plt_ind[sub_ind]],
+xlabel='Date',
+ylabel='Net Generation (GWh)',title='Generation Across US by source',
+labels=gen_labels[sub_ind],logy=False)
+plt.figure()
+plot_data_frame(df_usa.iloc[plt_ind[sub_ind]],
+xlabel='Date',
+ylabel='Net Generation (GWh)',title='Generation Across US by source',
+labels=gen_labels[sub_ind],logy=True)
+```
+
+
+![png](ELEC_explore_files/ELEC_explore_23_0.png)
+
+
+
+![png](ELEC_explore_files/ELEC_explore_23_1.png)
+
+
+
+```python
+d0=df_gen[df_gen['name'].str.contains('solar|photo')]
+plot_data_frame(d0,
+xlabel='Date',
+ylabel='Net Generation (GWh)',title='Solar Generation Across US by source')
+
+#plt.plot(d0['data2'])
+```
+
+
+![png](ELEC_explore_files/ELEC_explore_24_0.png)
+
+
+The last decade has seen wind and solar capacity growing exponentially, with wind having a large overall contribution, while utility scale solar is growing fastest of all. Otherwise there's multiple other small sources, which have been roughly constant over the period. Petroleum liquids show a similar dropoff to coal usage.
+
+Pumped storage is an anomaly: it's negative, and relatively constant. 
+
+## Oregon's Generation
+
+Let's look at the main contributors for Oregon's electricity generation, looking 
+
+
+```python
+def plot_generation_by_state(state):
+    """plot_generation_by_state
+    Takes a states name, and looks up net generation amounts across all 
+    sectors on a monthly frequency from SQL.  
+    Then plots the results.
+    """
+    out_col=('name','data','start','end','f')
+    match_names=['Net generation',': '+state+' :',': all sectors :'];    
+    state_gen=get_dataframe(cur,'ELEC',out_col,match_names,freq='M');
+    data0=convert_data(state_gen)
+    state_gen['data2']=data0
+
+    state_gen_max=state_gen['data2'].apply(max)
+    plt_ind=state_gen_max.sort_values(ascending=False).index
+    #extract out source part of labels via regex, select first match, and convert to array
+    gen_labels=state_gen.iloc[plt_ind]['name'].str.extractall('Net generation : ([\s\w\(\)-]+):')[0].values
+
+    plot_data_frame(state_gen.iloc[plt_ind],
+    xlabel='Date',
+    ylabel='Net Generation (GWh)',title='Generation Across '+state+' by source',
+    labels=gen_labels,logy=False)
+
+```
+
+
+```python
+# out_col=('name','data','start','end','f')
+# OR_gen=pd.DataFrame()
+# for gen_type in ('nuclear','coal','natural gas','solar','wind','hydro'):
+#     print('Getting '+gen_type);
+#     match_names=['Net generation',': Oregon :',gen_type, ': all sectors :'];
+#     df=get_dataframe(cur,'ELEC',out_col,match_names,freq='M');
+#     data0=convert_data(df)
+#     df['data2']=data0
+#     OR_gen=OR_gen.append(df)
+# OR_gen.index=np.arange(len(OR_gen))
+```
+
+    Nrows 1
+    Nrows 1
+    Getting hydro
+    Nrows 2
+    Getting wind
+    Nrows 1
+    Getting solar
+    Nrows 1
+    Getting natural gas
+    Nrows 0
+    Getting coal
+    Getting nuclear
+
+
+
+```python
+plot_generation_by_state('Nevada')
+```
+
+    Nrows 17
+
+
+
+![png](ELEC_explore_files/ELEC_explore_28_1.png)
+
+
+
+```python
+plot_generation_by_state('Oregon')
+```
+
+    Nrows 16
+
+
+
+![png](ELEC_explore_files/ELEC_explore_29_1.png)
+
+
+So hydroelectric and natural gas are the main generators, followed by wind.  There's small amount of energy provided by coal in the peak months of summer/winter.  The other sources appear to be negligible.
+
+## Cost of Electricity
+
+The other side of this is looking at the markets: customers, sales and costs of electricity.  Generation might occur in one place, but be sold to another state.  Let's start with retail price.  
+
+
+```python
+def plot_retail_price(region):
+    us_price=pd.DataFrame()
+    match_names=['retail price',': '+region+' :'];    
+    us_price=get_dataframe(cur,'ELEC',out_col,match_names,freq='M');
+    data0=convert_data(us_price)
+    us_price['data2']=data0
+    plot_data_frame(us_price,
+    xlabel='Date',
+    ylabel='Average cost (c/kWh)',title='Average Retail Price of Electricity Across '+region,logy=False)
+
+```
+
+
+```python
+plot_retail_price('United States')
+```
+
+    Nrows 6
+
+
+
+![png](ELEC_explore_files/ELEC_explore_32_1.png)
+
+
+
+```python
+plot_retail_price('Washington')
+```
+
+    Nrows 6
+
+
+
+![png](ELEC_explore_files/ELEC_explore_33_1.png)
+
+
+So prices have seen slow growth.  Once again, there is a clear seasonal pattern.  Residential customers pay the most, relative to commerical and industrial customers.  (perhaps reflects lack of certainty about demands/greater fluctuations/weaker negotiating power compared with industrial purposes.)  Looking at some state level estimates shows a large variation in seasonalilty and increases (e.g. Oregon, Washington show a slow increase, but Texas saw prices decrease since 2008.
+
+# Customer Accounts
+
+Let's grab the number of customer accounts (residential, commercial, industrial) for each state.
+The national plots show a slow growth, so we'l plot that and the totals. 
+
+
+```python
+def plot_customers(region):
+    us_price=pd.DataFrame()
+    match_names=['customer accounts',': '+region+' :'];    
+    us_price=get_dataframe(cur,'ELEC',out_col,match_names,freq='M');
+    data0=convert_data(us_price)
+    us_price['data2']=data0
+    plot_data_frame(us_price,
+    xlabel='Date',
+    ylabel='Number',title='Number of Customers Across '+region,logy=False)
+
+```
+
+
+```python
+plot_customers('Oregon')
+```
+
+    Nrows 5
+
+
+
+![png](ELEC_explore_files/ELEC_explore_36_1.png)
+
+
+## Geographic variability in 2016
+
+Time to break out some Matplotlib.baseplot goodness for plots of the US.
+(This is also directly relevant to the data available from the EIA, since the US is broken into 5 major power regions,
+which then interact by buying and selling electricity from one another.)
+Using annual data, which states use the most electricity of each type?
+
+Questions:
+-Largest growth in solar/wind since 2001. 
+-which state used most electricity in 2016/2017.
+-which state generated most electricity
+
+
+
+```python
+# try:
+# 	#Check if pickled(saved) Basemap instance is available - saves lots of time
+# 	m=pickle.load(open('usstates.pickle','rb'))
+# 	print('Loading Map from pickle')
+# except:
+#if not, remake the Basemap (costs lots of time)
+plt.figure()  
+print('Creating Fine BaseMap and storing with pickle')
+m=Basemap(projection='merc',llcrnrlon=-130,llcrnrlat=25,\
+        urcrnrlon=-65,urcrnrlat=50,resolution='l', \
+        lon_0=-115, lat_0=35)
+m.drawstates()
+m.drawcountries()
+#pickle.dump(m,open('map.pickle','wb'),-1)
+#actually draw the map
+m.drawcoastlines()
+plt.show()
+
+```
+
+
+![png](ELEC_explore_files/ELEC_explore_38_0.png)
+
+
+    Creating Fine BaseMap and storing with pickle
+
+
+
+```python
+from plot_usage import create_instance, plot_us_data, make_pop_data
+```
+
+
+```python
+def get_state_data(year):
+
+    #get a list of series IDs
+    state_names = (
+    'New Jersey',    'Rhode Island',    'Massachusetts',    'Connecticut',
+    'Maryland',    'New York',    'Delaware',    'Florida',
+    'Ohio',    'Pennsylvania',    'Illinois',    'California',
+    'Hawaii',    'Virginia',    'Michigan',    'Indiana',
+    'North Carolina',    'Georgia',    'Tennessee',    'New Hampshire',
+    'South Carolina',    'Louisiana',    'Kentucky',    'Wisconsin',
+    'Washington',    'Alabama',    'Missouri',    'Texas',
+    'West Virginia',    'Vermont',    'Minnesota',    'Mississippi',
+    'Iowa',    'Arkansas',    'Oklahoma',    'Arizona',
+    'Colorado',    'Maine',    'Oregon',    'Kansas',
+    'Utah',    'Nebraska',    'Nevada',    'Idaho',
+    'New Mexico',    'South Dakota',    'North Dakota',    'Montana',
+    'Wyoming',    'Alaska')
+
+    state_abbr=(
+    'NJ',  'RI',    'MA',    'CT',
+    'MD',    'NY',    'DE',    'FL',
+    'OH',    'PA',    'IL',    'CA',
+    'HI',    'VA',    'MI',    'IN',
+    'NC',    'GA',    'TN',    'NH',
+    'SC',    'LA',    'KY',    'WI',
+    'WA',    'AL',    'MO',    'TX',
+    'WV',    'VT',    'MN',    'MS',
+    'IA',    'AR',    'OK',    'AZ',
+    'CO',    'ME',    'OR',    'KS',
+    'UT',    'NE',    'NV',    'ID',
+    'NM',    'SD',    'ND',    'MT',
+    'WY',    'AK')
+
+    gen_types=['HYC','TSN','WND','COW','NUC','NG','ALL']
+
+    df_results=pd.DataFrame(columns=gen_types,index=state_names)
+
+    for i,state in enumerate(state_abbr):
+        for j,gen in enumerate(gen_types):
+            sql_str="""
+            SELECT series_id,obs_date,obs_val FROM "elec_gen"
+            WHERE series_id LIKE 'ELEC.GEN.{ser}-{state}-99.A' AND obs_date= DATE '{year}-12-31'""".format(ser=gen,state=state,year=year)
+            cur.execute(sql_str)
+            r=cur.fetchone()
+            if r is not None:
+                df_results.iloc[i,j]=r[2]
+    return df_results
+
+```
+
+
+```python
+df_tot=get_state_data('2015')
+```
+
+
+```python
+fig, ax = plt.subplots()
+m,m_=create_instance()
+plot_us_data(fig,ax,m,m_,data=(df_tot['HYC']/df_tot['ALL']).astype(float),
+label_text=r'Fractional Generation',title_text='Net Generation Fraction per State for Hydro in 2015')
+```
+
+    Loaded Basemap from file
+
+
+
+![png](ELEC_explore_files/ELEC_explore_42_1.png)
+
+
+
+```python
+fig, ax = plt.subplots()
+m,m_=create_instance()
+plot_us_data(fig,ax,m,m_,data=(df_tot['NG']/df_tot['ALL']).astype(float),
+label_text=r'Fractional Generation',title_text='Net Generation Fraction for Natural Gas in 2015')
+```
+
+    Loaded Basemap from file
+
+
+
+![png](ELEC_explore_files/ELEC_explore_43_1.png)
+
+
+
+```python
+fig, ax = plt.subplots()
+m,m_=create_instance()
+plot_us_data(fig,ax,m,m_,data=(df_tot['COW']/df_tot['ALL']).astype(float),
+label_text=r'Fractional Generation',title_text='Net Generation Fraction for Coal in 2015')
+```
+
+    Loaded Basemap from file
+
+
+
+![png](ELEC_explore_files/ELEC_explore_44_1.png)
+
+
+
+```python
+fig, ax = plt.subplots()
+m,m_=create_instance()
+plot_us_data(fig,ax,m,m_,data=(df_tot['WND']/df_tot['ALL']).astype(float),
+label_text=r'Fractional Generation',title_text='Net Generation Fraction for Wind in 2015')
+```
+
+    Loaded Basemap from file
+
+
+
+![png](ELEC_explore_files/ELEC_explore_45_1.png)
+
+
+
+```python
+fig, ax = plt.subplots()
+m,m_=create_instance()
+plot_us_data(fig,ax,m,m_,data=(df_tot['TSN']/df_tot['ALL']).astype(float),
+label_text=r'Fractional Generation',title_text='Net Generation Fraction for Total Solar in 2015')
+```
+
+    Loaded Basemap from file
+
+
+
+![png](ELEC_explore_files/ELEC_explore_46_1.png)
+
+
+
+```python
+
+```
+
+
+```python
+# # use SQL to find names.
+# # Will be more efficient to hard-code.
+# sql_str="""
+# SELECT name,series_id FROM "ELEC"
+# WHERE name LIKE 'Net generation %' AND name LIKE '%: {0} :%' 
+# AND name LIKE '%: all sectors :%' AND f LIKE '{1}'""".format('United States','A')
+# cur.execute(sql_str)
+
+```
+
+Some striking patterns here.  These plots are looking at fraction of the total generated.  There seem to be some pretty clear political/incentive effects here.  For example in solar: the north east is a poor place for solar, yet a larger fraction is generated there, over places like Texas or Utah.  (So there's an obvious political dimension to this).  
+
+Wind shows less of a crazy divide.  Natural Gas is conspicuous in its absence across the central US - I think this competes with coal.  Looking at the trend over time, it looks like Natural Gas has supplanted Coal generation - yet another political angle in terms of new plants.  
+
+Hydro is heavily dependent on the available resource - the Columbia gorge is super obvious in OR/WAs generation.  This isn't showing Canada's huge hydro generation, which is a major exporter of electricity to the US.  
+
+## Near Real-time data.
+
+Now to load in some of the actual operating data (which is in a different table in the same database).
+Ok, that is not really working, since I screwed up loading the data into the database.
+
+
+
+```python
+database_name='US_ELEC'
+fname='EBA'
+table_name=fname
+engine2=sqlalchemy.create_engine("postgresql+psycopg2://localhost/"+database_name)
+#make connection to database (which is needed by Pandas), 
+# and the cursor which actually executes SQL commands.
+conn2=psycopg2.connect(dbname=database_name,host='localhost')
+conn2.set_session(autocommit=True)
+cur2 = conn2.cursor()
+```
+
+
+```python
+def fetch_eba_series(cur2,region,series_type):
+    """fetch_eba_series(cur2,region,series_type)
+    Call PostgreSQL server to pull up the series relating to
+    a given region and type of series.
+    
+    cur2: psycopg2 cursor object on relevant table
+    region: name of the region/ISO we want the series for
+    series_type: the type of data series for a given ISO
+    """
+    print('Getting '+region+':'+series_type);
+    df=get_dataframe(cur2,'EBA',out_col,[region,series_type],freq='H');
+    data0=convert_data(df)
+    df['data2']=data0
+    return df
+
+#Read in some representative data.
+out_col=('name','data','start','end','f')
+df_eba_tot=pd.DataFrame()
+
+region_list=["Northwest (region)",'Southwest (region)','Southeast (region)',\
+            'Midwest (region)','Central (region)','California (region)',\
+            'Texas','Tennessee','Florida (region)','Carolinas (region)','New York','New England'];
+series_type=['Net generation','Demand','demand forecast','retail'];
+for region in region_list:
+#     for gen_type in series_list:
+    series_type='Demand'
+    df = fetch_eba_series(cur2,region,series_type)
+    print(df['name'])
+    df_eba_tot=df_eba_tot.append(df)
+
+```
+
+    Getting Northwest (region):Demand
+    1
+    Converting # 0
+    0    Demand for Northwest (region), Hourly
+    Name: name, dtype: object
+    Getting Southwest (region):Demand
+    1
+    Converting # 0
+    0    Demand for Southwest (region), Hourly
+    Name: name, dtype: object
+    Getting Southeast (region):Demand
+    1
+    Converting # 0
+    0    Demand for Southeast (region), Hourly
+    Name: name, dtype: object
+    Getting Midwest (region):Demand
+    1
+    Converting # 0
+    0    Demand for Midwest (region), Hourly
+    Name: name, dtype: object
+    Getting Central (region):Demand
+    1
+    Converting # 0
+    0    Demand for Central (region), Hourly
+    Name: name, dtype: object
+    Getting California (region):Demand
+    1
+    Converting # 0
+    0    Demand for California (region), Hourly
+    Name: name, dtype: object
+    Getting Texas:Demand
+    1
+    Converting # 0
+    0    Demand for Electric Reliability Council of Texas, Inc. (ERCO), Hourly
+    Name: name, dtype: object
+    Getting Tennessee:Demand
+    1
+    Converting # 0
+    0    Demand for Tennessee Valley Authority (TVA), Hourly
+    Name: name, dtype: object
+    Getting Florida (region):Demand
+    1
+    Converting # 0
+    0    Demand for Florida (region), Hourly
+    Name: name, dtype: object
+    Getting Carolinas (region):Demand
+    1
+    Converting # 0
+    0    Demand for Carolinas (region), Hourly
+    Name: name, dtype: object
+    Getting New York:Demand
+    1
+    Converting # 0
+    0    Demand for New York Independent System Operator (NYIS), Hourly
+    Name: name, dtype: object
+    Getting New England:Demand
+    1
+    Converting # 0
+    0    Demand for New England ISO (ISNE), Hourly
+    Name: name, dtype: object
+
+
+
+```python
+plot_data_frame(df_eba_tot[7:8])
+#plot_data_frame(df_eba_tot)
+```
+
+
+![png](ELEC_explore_files/ELEC_explore_53_0.png)
+
+
+
+```python
+d0=df_eba_tot[7:8]['data2']
+np.argmax(d0)
+```
+
+
+    ---------------------------------------------------------------------------
+
+    ValueError                                Traceback (most recent call last)
+
+    <ipython-input-52-6388b9343775> in <module>()
+          1 d0=df_eba_tot[7:8]['data2']
+    ----> 2 np.argmax(d0)
+    
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/numpy/core/fromnumeric.py in argmax(a, axis, out)
+        961 
+        962     """
+    --> 963     return _wrapfunc(a, 'argmax', axis=axis, out=out)
+        964 
+        965 
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/numpy/core/fromnumeric.py in _wrapfunc(obj, method, *args, **kwds)
+         55 def _wrapfunc(obj, method, *args, **kwds):
+         56     try:
+    ---> 57         return getattr(obj, method)(*args, **kwds)
+         58 
+         59     # An AttributeError occurs if the object does not have
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/series.py in idxmax(self, axis, skipna, *args, **kwargs)
+       1262         """
+       1263         skipna = nv.validate_argmax_with_skipna(skipna, args, kwargs)
+    -> 1264         i = nanops.nanargmax(_values_from_object(self), skipna=skipna)
+       1265         if i == -1:
+       1266             return np.nan
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/nanops.py in nanargmax(values, axis, skipna)
+        476     """
+        477     values, mask, dtype, _ = _get_values(values, skipna, fill_value_typ='-inf',
+    --> 478                                          isfinite=True)
+        479     result = values.argmax(axis)
+        480     result = _maybe_arg_null_out(result, axis, mask, skipna)
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/nanops.py in _get_values(values, skipna, fill_value, fill_value_typ, isfinite, copy)
+        194     values = _values_from_object(values)
+        195     if isfinite:
+    --> 196         mask = _isfinite(values)
+        197     else:
+        198         mask = isnull(values)
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/nanops.py in _isfinite(values)
+        237             is_integer_dtype(values) or is_bool_dtype(values)):
+        238         return ~np.isfinite(values)
+    --> 239     return ~np.isfinite(values.astype('float64'))
+        240 
+        241 
+
+
+    ValueError: setting an array element with a sequence.
+
+
+
+```python
+i0=0
+d0=df_eba_tot.iloc[i0*3]['data2'];  #Generation
+d1=df_eba_tot.iloc[i0*3+1]['data2'];  #Actual Demand
+d2=df_eba_tot.iloc[i0*3+2]['data2'];  #Day ahead demand forecast
+```
+
+
+    ---------------------------------------------------------------------------
+
+    TypeError                                 Traceback (most recent call last)
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/indexes/base.py in get_value(self, series, key)
+       2482             try:
+    -> 2483                 return libts.get_value_box(s, key)
+       2484             except IndexError:
+
+
+    pandas/_libs/tslib.pyx in pandas._libs.tslib.get_value_box (pandas/_libs/tslib.c:18843)()
+
+
+    pandas/_libs/tslib.pyx in pandas._libs.tslib.get_value_box (pandas/_libs/tslib.c:18477)()
+
+
+    TypeError: 'str' object cannot be interpreted as an integer
+
+    
+    During handling of the above exception, another exception occurred:
+
+
+    KeyError                                  Traceback (most recent call last)
+
+    <ipython-input-34-1cde11497d6f> in <module>()
+          1 i0=0
+    ----> 2 d0=df_eba_tot.iloc[i0*3]['data2'];  #Generation
+          3 d1=df_eba_tot.iloc[i0*3+1]['data2'];  #Actual Demand
+          4 d2=df_eba_tot.iloc[i0*3+2]['data2'];  #Day ahead demand forecast
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/series.py in __getitem__(self, key)
+        599         key = com._apply_if_callable(key, self)
+        600         try:
+    --> 601             result = self.index.get_value(self, key)
+        602 
+        603             if not is_scalar(result):
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/indexes/base.py in get_value(self, series, key)
+       2489                     raise InvalidIndexError(key)
+       2490                 else:
+    -> 2491                     raise e1
+       2492             except Exception:  # pragma: no cover
+       2493                 raise e1
+
+
+    /home/jonathan/anaconda3/lib/python3.6/site-packages/pandas/core/indexes/base.py in get_value(self, series, key)
+       2475         try:
+       2476             return self._engine.get_value(s, k,
+    -> 2477                                           tz=getattr(series.dtype, 'tz', None))
+       2478         except KeyError as e1:
+       2479             if len(self) > 0 and self.inferred_type in ['integer', 'boolean']:
+
+
+    pandas/_libs/index.pyx in pandas._libs.index.IndexEngine.get_value()
+
+
+    pandas/_libs/index.pyx in pandas._libs.index.IndexEngine.get_value()
+
+
+    pandas/_libs/index.pyx in pandas._libs.index.IndexEngine.get_loc()
+
+
+    pandas/_libs/hashtable_class_helper.pxi in pandas._libs.hashtable.PyObjectHashTable.get_item()
+
+
+    pandas/_libs/hashtable_class_helper.pxi in pandas._libs.hashtable.PyObjectHashTable.get_item()
+
+
+    KeyError: 'data2'
+
+
+
+```python
+#check for weird points.  This plot is fore the region of maximum discrepency between the forecast and actual demand.
+t0=np.argmax(abs(d2-d1))
+delta=pd.Timedelta(2,'D');
+t1 = t0-delta;
+t2= t0+delta;
+trange=pd.DatetimeIndex(start=t1,end=t2,freq='H')
+plt.plot(trange,d1[trange],'-x',label='Demand')
+plt.plot(trange,d2[trange],'-x',label='Forecast')
+plt.plot(trange,d0[trange],'-x',label='Generation')
+plt.legend(loc='upper left',bbox_to_anchor=(1,1))
+plt.show()
+
+```
+
+
+![png](ELEC_explore_files/ELEC_explore_56_0.png)
+
+
+
+```python
+So that wasn't an error, but a real spike in demand.  Obviously the generation made up the difference.
+```
+
+
+```python
+
+plt.plot(1-d2/d1)
+plt.show()
+```
+
+
+![png](ELEC_explore_files/ELEC_explore_58_0.png)
+
+
+Finally (months after I first wanted to do this), we can start looking at some data.  
+I would like to review the sources of electricity to get a sense of seasonal variations (in terms of availability and use).  For example, I'd expect solar generation to be largest in summer, lowest in winter.  
+I would assume this varies geographically.  I'll assume the seasonality can be averaged over by using the annual data. 
+
+Residential Use will be largest in winter, barring the occasional fluctuation in summer.  
+
+The purpose of this survey is to identify the scale of renewables in the market.  
+How large a share do renewables (solar, hydro, wind) take up?  How does this vary regionally?  Over time? 
+Who are the primary users of electricity?  
+I'll assume the base load is provided by coal, gas and nuclear plants.  
+
+
+Ultimately however, I intend to try my hand at some machine learning projects relevant to electricity.  
+The first project involves demand forecasting.  The other place where data science (and nifty math) may have a role in this, is on the market.  While I am comfortable with stochastic calculus etc, I would need to learn about options pricing
+and the relevant techniques for this sector of the energy market.
+
+This is meant to be a brief background piece for that.  Since we are forecasting a time series,
+I aim to use TensorFlow with some form of neural network (perhaps recurrent) to try forecasting.
+Ideally, I would cross-reference the electricity data sets against the published weather forecasts for a given day.  
+The model should be able to predict demand given the location, time of year, and weather forecast.  (This is probably the 
+simplest thing available)
+
+From a smart-grid perspective, how can randomly fluctuating sources, such as solar and wind, be included 
+in supplying power to the grid?  
+
+
