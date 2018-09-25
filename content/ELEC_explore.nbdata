@@ -1,0 +1,6 @@
+Title: Exploring US Electrical Grid using EIA data
+Author: Jonathan Mackrory
+Slug: us-explore
+Date: Sep 25, 2018
+Category: Python, SQL
+Summary: Unpolished notebook using Python and SQL to explore EIA's ELEC data to get grip on broad trends for grid.
