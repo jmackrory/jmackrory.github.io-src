@@ -1,7 +1,7 @@
 Title: My first test
-Author: Jehosophat Mackrory
+Author: J. Mackrory
 Date: Sep 25, 2018
-Category: Nonsense
+Category: Testing
 
 # A first test webpage.
 
