@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*- #
 from __future__ import unicode_literals
 
-AUTHOR = 'J. Mackrory'
-SITENAME = "Jonathan's Data Science Portfolio"
+AUTHOR = 'Jonathan Mackrory'
+SITENAME = "Jonathan's Extra Special Unique Data Science Portfolio"
 SITEURL = ''
 
 PATH = 'content'
@@ -33,9 +33,3 @@ DEFAULT_PAGINATION = 10
 
 # Uncomment following line if you want document-relative URLs when developing
 #RELATIVE_URLS = True
-
-#Added lines to allow pelican-ipynb plugin to work
-MARKUP = ('md', 'ipynb')
-
-PLUGIN_PATH = './plugins'
-PLUGINS = ['ipynb.markup']
