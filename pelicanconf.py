@@ -34,9 +34,9 @@ DEFAULT_PAGINATION = 10
 
 #THEME="pelican-themes/pelican-blue"
 THEME="pelican-themes/pure-single"
-COVER_IMG_URL="blog/img_4005.jpg"
+COVER_IMG_URL="photos/img_4005.jpg"
 
-STATIC_PATHS=['blog']
+STATIC_PATHS=['photos']
 
 # Uncomment following line if you want document-relative URLs when developing
 #RELATIVE_URLS = True
