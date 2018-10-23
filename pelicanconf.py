@@ -26,8 +26,6 @@ AUTHOR_FEED_RSS = None
 #          ('You can modify those links in your config file', '#'),)
 
 # Social widget
-# SOCIAL = (('You can add links in your config file', '#'),
-#           ('Another social link', '#'),)
 SOCIAL = (('github', 'https://github.com/jmackrory'),)
 
 DEFAULT_PAGINATION = 10
@@ -39,7 +37,7 @@ COVER_IMG_URL="photos/img_4005.jpg"
 STATIC_PATHS=['photos']
 
 # Uncomment following line if you want document-relative URLs when developing
-#RELATIVE_URLS = True
+RELATIVE_URLS = True
 
 #Added lines to allow pelican-ipynb plugin to work
 MARKUP = ('md', 'ipynb')
@@ -47,6 +45,8 @@ MARKUP = ('md', 'ipynb')
 PLUGIN_PATHS = ['./plugins']
 PLUGINS = ['ipynb.markup']
 
-MENU_ITEMS=['About Me']
+MENUITEMS=(('About Me','/pages/about-me.html'),
+            ('Electricity Project','/pages/us-electricity-project.html'),
+            ('Graduate Work','/pages/physics-studies.html'))
 
 
